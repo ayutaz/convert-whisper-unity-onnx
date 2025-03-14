@@ -26,17 +26,6 @@ import numpy as np
 
 from transformers import WhisperForConditionalGeneration
 
-# ------------------------------------------------
-# 1) Log-Mel変換用: PyTorch nn.Module
-# ------------------------------------------------
-import torch
-import torch.nn as nn
-import librosa
-import math
-
-import torch
-import torch.nn as nn
-import librosa
 
 class LogMelSpectrogram(nn.Module):
     def __init__(
@@ -77,7 +66,7 @@ class LogMelSpectrogram(nn.Module):
         wav shape: (batch, samples)
         return: log_mel shape: (batch, n_mels, time)
         """
-        # STFT: return_complex=False => 出力 (batch, freq, frames, 2)
+        # STFT: return_complex=False => 出力 (batch, freq_bins, frames, 2)
         stft_out = torch.stft(
             wav,
             n_fft=self.n_fft,
@@ -90,32 +79,24 @@ class LogMelSpectrogram(nn.Module):
         )
         # => stft_out.shape: (batch, freq_bins, frames, 2)
         # 実部＆虚部
-        real = stft_out[..., 0]  # (batch, freq, frames)
-        imag = stft_out[..., 1]  # (batch, freq, frames)
+        real = stft_out[..., 0]  # (batch, freq_bins, frames)
+        imag = stft_out[..., 1]  # (batch, freq_bins, frames)
 
         # 振幅スペクトル = sqrt(real^2 + imag^2)
         magnitudes = (real**2 + imag**2).sqrt()  # shape: (batch, freq_bins, frames)
 
         # mel_filter.shape = (freq_bins, n_mels)
         # => 行列積には “(batch, frames, freq_bins) x (freq_bins, n_mels)” = (batch, frames, n_mels)
-        # => 転置して (batch, freq_bins, frames) => (batch, frames, freq_bins)
         magnitudes_T = magnitudes.transpose(1, 2)  # (batch, frames, freq_bins)
 
-        mel = torch.matmul(magnitudes_T, self.mel_filter)  # => shape: (batch, frames, n_mels)
-
-        # 軸を (batch, n_mels, frames) に戻す
-        mel = mel.transpose(1, 2)
+        mel = torch.matmul(magnitudes_T, self.mel_filter)  # => (batch, frames, n_mels)
+        mel = mel.transpose(1, 2)  # => (batch, n_mels, frames)
 
         # log変換
         log_mel = torch.clamp(mel, min=1e-10).log10()
         return log_mel
 
 
-
-
-# ------------------------------------------------
-# 2) Whisperエンコーダのみをラップしたモジュール
-# ------------------------------------------------
 class WhisperEncoder(nn.Module):
     def __init__(self, hf_whisper: WhisperForConditionalGeneration):
         super().__init__()
@@ -135,9 +116,6 @@ class WhisperEncoder(nn.Module):
         return encoder_outputs.last_hidden_state
 
 
-# ------------------------------------------------
-# 3) 最初の推論用デコーダ (past_key_values=None)
-# ------------------------------------------------
 class WhisperDecoderNoPast(nn.Module):
     """
     デコーダをpastなしで呼び出し、present_key_valuesを出力する。
@@ -155,14 +133,11 @@ class WhisperDecoderNoPast(nn.Module):
             past_key_values=None,
             use_cache=True
         )
-        # outputs.last_hidden_state shape = (batch, dec_seq, hidden_size)
-        hidden = outputs.last_hidden_state
-        logits = self.lm_head(hidden)  # (batch, dec_seq, vocab_size)
+        hidden = outputs.last_hidden_state  # (batch, dec_seq, hidden_size)
+        logits = self.lm_head(hidden)       # (batch, dec_seq, vocab_size)
 
-        pkv = outputs.past_key_values
-        # pkvはtuple( (dec_key,dec_val,enc_key,enc_val), ... ) x num_layers
+        pkv = outputs.past_key_values  # tuple of (dec_k, dec_v, enc_k, enc_v) × num_layers
 
-        # Unity実装に合わせ、"logits" と "present.X.decoder.key"等を出力
         out_dict = {"logits": logits}
         for i, (dec_k, dec_v, enc_k, enc_v) in enumerate(pkv):
             out_dict[f"present.{i}.decoder.key"]   = dec_k
@@ -173,9 +148,6 @@ class WhisperDecoderNoPast(nn.Module):
         return out_dict
 
 
-# ------------------------------------------------
-# 4) 2トークン目以降の再帰デコーダ (past_key_valuesあり)
-# ------------------------------------------------
 class WhisperDecoderWithPast(nn.Module):
     def __init__(self, hf_whisper: WhisperForConditionalGeneration, num_layers=4):
         super().__init__()
@@ -187,10 +159,9 @@ class WhisperDecoderWithPast(nn.Module):
         self,
         input_ids,               # shape: (batch, dec_seq)
         encoder_hidden_states,   # shape: (batch, enc_seq, hidden_size)
-        *past_key_values_flat    # dec_k,dec_v,enc_k,enc_v のフラット展開 × num_layers
+        *past_key_values_flat
     ):
         # past_kvsを再構築
-        # tinyの場合 num_layers=4、1レイヤーにつき(dec_k, dec_v, enc_k, enc_v)=4つ ⇒ 合計16個
         pkv_tuple = []
         for i in range(self.num_layers):
             offset = i * 4
@@ -221,22 +192,16 @@ class WhisperDecoderWithPast(nn.Module):
 
 
 def main():
-    # ------------------------------------------------
-    # Whisper (多言語Tiny) のダウンロード＆ロード
-    # ------------------------------------------------
     print("Loading Hugging Face model: openai/whisper-tiny (multilingual)")
     hf_whisper = WhisperForConditionalGeneration.from_pretrained("openai/whisper-tiny")
     hf_whisper.eval()
 
-    # ------------------------------------------------
-    # 1) export logmel_spectrogram
-    # ------------------------------------------------
+    # 1) logmel_spectrogram
     print("Exporting logmel_spectrogram.onnx ...")
     logmel = LogMelSpectrogram()
     logmel.eval()
 
-    # ダミー入力: (batch=1, samples=480000) = 30秒
-    dummy_wav = torch.randn(1, 16000*30)
+    dummy_wav = torch.randn(1, 16000 * 30)
     torch.onnx.export(
         logmel,
         dummy_wav,
@@ -250,13 +215,11 @@ def main():
         }
     )
 
-    # ------------------------------------------------
-    # 2) export encoder_model
-    # ------------------------------------------------
+    # 2) encoder_model
     print("Exporting encoder_model.onnx ...")
     encoder_model = WhisperEncoder(hf_whisper)
     encoder_model.eval()
-    dummy_logmel = torch.randn(1, 80, 3000)  # (batch=1, n_mels=80, time=3000)
+    dummy_logmel = torch.randn(1, 80, 3000)
     torch.onnx.export(
         encoder_model,
         dummy_logmel,
@@ -270,14 +233,12 @@ def main():
         }
     )
 
-    # ------------------------------------------------
-    # 3) export decoder_model (NoPast)
-    # ------------------------------------------------
+    # 3) decoder_model (NoPast)
     print("Exporting decoder_model.onnx ...")
     decoder_no_past = WhisperDecoderNoPast(hf_whisper)
     decoder_no_past.eval()
-    dummy_input_ids = torch.randint(0, 50000, (1, 5))      # (batch=1, dec_seq=5)
-    dummy_enc_out   = torch.randn(1, 3000, 384)           # (batch=1, enc_seq=3000, hidden=384 for tiny)
+    dummy_input_ids = torch.randint(0, 50000, (1, 5))
+    dummy_enc_out   = torch.randn(1, 3000, 384)
     torch.onnx.export(
         decoder_no_past,
         (dummy_input_ids, dummy_enc_out),
@@ -298,20 +259,19 @@ def main():
         }
     )
 
-    # ------------------------------------------------
-    # 4) export decoder_with_past_model
-    # ------------------------------------------------
+    # 4) decoder_with_past_model
     print("Exporting decoder_with_past_model.onnx ...")
     decoder_with_past = WhisperDecoderWithPast(hf_whisper, num_layers=4)
     decoder_with_past.eval()
-    dummy_input_ids_2 = torch.randint(0, 50000, (1, 1)) # (batch=1, dec_seq=1)
+    dummy_input_ids_2 = torch.randint(0, 50000, (1, 1))
+    dummy_enc_out_2   = torch.randn(1, 3000, 384)
+
     # 過去のkv(4レイヤー) => (dec_k, dec_v, enc_k, enc_v)*4=16個
     dummy_past_kvs = []
     for i in range(4):
-        # shapeはTinyを想定(Heads=6, head_dim=64) => dec_kなどのseq_length部は増分
-        dec_k = torch.randn(1, 6, 5, 64)      # (batch=1, heads=6, past_dec_seq=5, head_dim=64)
+        dec_k = torch.randn(1, 6, 5, 64)  # (batch=1, heads=6, past_dec_seq=5, head_dim=64)
         dec_v = torch.randn(1, 6, 5, 64)
-        enc_k = torch.randn(1, 6, 3000, 64)   # (batch=1, heads=6, enc_seq=3000, head_dim=64)
+        enc_k = torch.randn(1, 6, 3000, 64)
         enc_v = torch.randn(1, 6, 3000, 64)
         dummy_past_kvs += [dec_k, dec_v, enc_k, enc_v]
 
@@ -333,22 +293,35 @@ def main():
             f"present.{i}.encoder.value",
         ]
 
+    # ★ここで past_key_values の軸を動的指定する
+    #  - decoder.key/value は shape = (batch, heads, past_dec_seq, head_dim)
+    #  - encoder.key/value は shape = (batch, heads, enc_seq, head_dim)
+    #   などに合わせて {2: "past_dec_seq"} or {2: "enc_seq"} を指定します
+    dynamic_axes_dict = {
+        "input_ids": {1: "dec_seq"},
+        "encoder_hidden_states": {1: "enc_seq"},
+        "logits": {1: "dec_seq"},
+    }
+    for layer_idx in range(4):
+        # decoder key/value => dimension 2 = past_dec_seq
+        dynamic_axes_dict[f"past_key_values.{layer_idx}.decoder.key"] = {2: "past_dec_seq"}
+        dynamic_axes_dict[f"past_key_values.{layer_idx}.decoder.value"] = {2: "past_dec_seq"}
+        # encoder side => dimension 2 = enc_seq (if we want dynamic, same as "encoder_hidden_states")
+        dynamic_axes_dict[f"past_key_values.{layer_idx}.encoder.key"] = {2: "enc_seq"}
+        dynamic_axes_dict[f"past_key_values.{layer_idx}.encoder.value"] = {2: "enc_seq"}
+
     torch.onnx.export(
         decoder_with_past,
-        (dummy_input_ids_2, dummy_enc_out, *dummy_past_kvs),
+        (dummy_input_ids_2, dummy_enc_out_2, *dummy_past_kvs),
         "decoder_with_past_model.onnx",
         opset_version=17,
         input_names=input_names,
         output_names=output_names,
-        dynamic_axes={
-            "input_ids": {1: "dec_seq"},
-            "encoder_hidden_states": {1: "enc_seq"},
-            "logits": {1: "dec_seq"},
-            # past_key_values/presentはtime軸が伸びたりするので詳しく指定するなら各dimを定義
-        }
+        dynamic_axes=dynamic_axes_dict
     )
 
     print("All 4 ONNX files have been exported successfully!")
+
 
 if __name__ == "__main__":
     main()
