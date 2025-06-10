@@ -36,7 +36,7 @@ pycparser==2.22
 pyreadline3==3.5.4
 pyyaml==6.0.2
 regex==2024.11.6
-requests==2.32.3
+requests==2.32.4
 safetensors==0.5.3
 scikit-learn==1.6.1
 scipy==1.15.2
